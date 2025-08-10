@@ -134,6 +134,11 @@ class ToggleAutoModelRequest(BaseModel):
 
 class AIProvider:
     """Abstract base for AI providers"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.available = False
+        self.models: List[str] = []
     
 class OllamaProvider(AIProvider):
     """Ollama local models provider"""
