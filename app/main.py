@@ -18,13 +18,20 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from dotenv import load_dotenv
 load_dotenv()
 
-import ollama
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+# Try to import ollama, but make it optional
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("Warning: ollama package not available, Ollama functionality will be disabled")
 
 # Conditional imports for AI providers
 try:
