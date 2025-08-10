@@ -135,18 +135,48 @@ class ToggleAutoModelRequest(BaseModel):
 class AIProvider:
     """Abstract base for AI providers"""
     
-   def _check_availability(self):
-    """Check if Ollama is available"""
-    try:
-        if not OLLAMA_AVAILABLE:
-            logger.warning("ollama_package_unavailable")
+class OllamaProvider(AIProvider):
+    """Ollama local models provider"""
+
+    def __init__(self):
+        super().__init__("ollama")
+        self.host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
+        self.timeout = int(os.getenv('OLLAMA_TIMEOUT', '30'))
+        self._check_availability()
+
+    def _check_availability(self):
+        """Check if Ollama is available"""
+        try:
+            if not OLLAMA_AVAILABLE:
+                logger.warning("ollama_package_unavailable")
+                self.available = False
+                self.models = []
+                return
+                
+            client = ollama.Client(host=self.host, timeout=self.timeout)
+            response = client.list()
+            # Extract model names correctly from Ollama response
+            self.models = []
+            for model_info in response.get('models', []):
+                if hasattr(model_info, 'model'):
+                    # New ollama client returns objects
+                    model_name = model_info.model
+                elif isinstance(model_info, dict):
+                    # Fallback for dict format
+                    model_name = model_info.get('model') or model_info.get('name')
+                else:
+                    continue
+
+                if model_name:
+                    self.models.append(model_name)
+
+            self.available = len(self.models) > 0
+            if self.available:
+                logger.info(f"ollama_models_found", count=len(self.models), models=self.models)   
+        except Exception as e:
+            logger.warning(f"ollama_connection_failed", error=str(e))
             self.available = False
             self.models = []
-            return
-            
-        client = ollama.Client(host=self.host, timeout=self.timeout)
-        response = client.list()
-        # Rest of the method stays the same...
     
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response"""
