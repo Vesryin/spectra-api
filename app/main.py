@@ -39,6 +39,13 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    HUGGINGFACE_AVAILABLE = False
+
 if TYPE_CHECKING:
     from typing import Any as _Any
     structlog: _Any
@@ -149,64 +156,143 @@ class AIProvider:
         """Refresh provider availability - override in subclasses"""
         pass
 
-class OllamaProvider(AIProvider):
-    """Ollama local models provider"""
+class HuggingFaceProvider(AIProvider):
+    """Hugging Face models provider"""
     
     def __init__(self):
-        super().__init__("ollama")
-        self.host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-        self.timeout = int(os.getenv('OLLAMA_TIMEOUT', '30'))
+        super().__init__("huggingface")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.default_model = os.getenv('HF_MODEL', 'mistralai/Mistral-7B-Instruct-v0.2')
+        self.available_models = os.getenv('HF_MODELS', 'mistralai/Mistral-7B-Instruct-v0.2,meta-llama/Llama-2-7b-chat-hf').split(',')
+        self.models = []
+        self.model_cache = {}  # Cache for loaded models and tokenizers
         self._check_availability()
     
     def _check_availability(self):
-        """Check if Ollama is available"""
+        """Check if Hugging Face is available"""
         try:
-            client = ollama.Client(host=self.host, timeout=self.timeout)
-            response = client.list()
-            # Extract model names correctly from Ollama response
-            self.models = []
-            for model_info in response.get('models', []):
-                if hasattr(model_info, 'model'):
-                    # New ollama client returns objects
-                    model_name = model_info.model
-                elif isinstance(model_info, dict):
-                    # Fallback for dict format
-                    model_name = model_info.get('model') or model_info.get('name')
-                else:
-                    continue
-                
-                if model_name:
-                    self.models.append(model_name)
-            
-            self.available = len(self.models) > 0
-            if self.available:
-                logger.info(f"ollama_models_found", count=len(self.models), models=self.models)
+            if HUGGINGFACE_AVAILABLE:
+                # Filter models that are actually available in the Hugging Face Hub
+                self.models = [model.strip() for model in self.available_models]
+                self.available = len(self.models) > 0
+                if self.available:
+                    logger.info(f"huggingface_models_found", count=len(self.models), models=self.models)
+            else:
+                self.available = False
+                logger.warning("huggingface_not_available", error="transformers or torch not installed")
         except Exception as e:
-            logger.warning(f"ollama_connection_failed", error=str(e))
+            logger.warning(f"huggingface_init_failed", error=str(e))
             self.available = False
             self.models = []
     
     def refresh_availability(self) -> None:
-        """Refresh Ollama availability"""
+        """Refresh Hugging Face availability"""
         self._check_availability()
     
+    def _format_chat_to_prompt(self, messages: List[Dict[str, str]], model: str) -> str:
+        """Format chat messages into a prompt string based on the model architecture"""
+        prompt = ""
+        system_prompt = None
+
+        for message in messages:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            
+            if role == "system":
+                system_prompt = content
+            elif role == "user":
+                if "mistral" in model.lower():
+                    prompt += f"<s>[INST] {content} [/INST]"
+                elif "llama" in model.lower():
+                    prompt += f"<s>[INST] {content} [/INST]"
+                else:
+                    # Default format
+                    prompt += f"User: {content}\n"
+            elif role == "assistant":
+                if "mistral" in model.lower() or "llama" in model.lower():
+                    prompt += f" {content} </s>"
+                else:
+                    # Default format
+                    prompt += f"Assistant: {content}\n"
+        
+        # Add system prompt at the beginning if available
+        if system_prompt and prompt:
+            if "mistral" in model.lower():
+                # Insert system prompt at the beginning of the first user message
+                prompt = prompt.replace("[INST]", f"[INST] {system_prompt}\n\n", 1)
+            elif "llama" in model.lower():
+                prompt = prompt.replace("[INST]", f"[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n", 1)
+            else:
+                # Default format
+                prompt = f"System: {system_prompt}\n" + prompt
+        
+        return prompt
+    
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
-        """Generate chat response using Ollama"""
+        """Generate chat response using Hugging Face models"""
+        if not self.available:
+            raise HTTPException(status_code=500, detail="Hugging Face not available")
+        
         try:
-            client = ollama.Client(host=self.host, timeout=self.timeout)
-            response = await asyncio.to_thread(
-                client.chat,
-                model=model,
-                messages=messages,
-                options=kwargs.get('options', {})
+            model_name = model or self.default_model
+            
+            # Format the chat messages into a prompt
+            prompt = self._format_chat_to_prompt(messages, model_name)
+            
+            # Check if model is already loaded in cache
+            if model_name not in self.model_cache:
+                # Load model and tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model_instance = AutoModelForCausalLM.from_pretrained(
+                    model_name, 
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                    low_cpu_mem_usage=True,
+                    device_map="auto"
+                )
+                self.model_cache[model_name] = (model_instance, tokenizer)
+            else:
+                model_instance, tokenizer = self.model_cache[model_name]
+            
+            # Create text generation pipeline
+            pipe = pipeline(
+                "text-generation",
+                model=model_instance,
+                tokenizer=tokenizer,
+                device=self.device
             )
+            
+            # Generate response
+            generation_kwargs = {
+                "max_new_tokens": kwargs.get('max_tokens', 512),
+                "temperature": kwargs.get('temperature', 0.7),
+                "do_sample": True,
+                "top_p": 0.95,
+            }
+            
+            # Run generation in a separate thread to avoid blocking
+            response = await asyncio.to_thread(
+                pipe,
+                prompt,
+                **generation_kwargs
+            )
+            
+            # Extract generated text
+            generated_text = response[0]['generated_text']
+            
+            # Extract only the new content (not including the prompt)
+            assistant_response = generated_text[len(prompt):].strip()
+            
+            # Clean up response formatting
+            if assistant_response.startswith("Assistant: "):
+                assistant_response = assistant_response[len("Assistant: "):]
+            
             return {
-                "content": response['message']['content'],
-                "model": model,
-                "provider": "ollama"
+                "content": assistant_response,
+                "model": model_name,
+                "provider": "huggingface"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Hugging Face error: {str(e)}")
 
 class OpenAIProvider(AIProvider):
     """OpenAI ChatGPT provider"""
@@ -302,7 +388,7 @@ class SpectraAI:
         
         # Initialize AI providers
         self.providers: Dict[str, AIProvider] = {
-            'ollama': OllamaProvider(),
+            'huggingface': HuggingFaceProvider(),
             'openai': OpenAIProvider(),
             'anthropic': AnthropicProvider()
         }
@@ -312,9 +398,9 @@ class SpectraAI:
         self.available_models = self._get_all_available_models()
         
         # Set default provider and model
-        provider_priority = os.getenv('AI_PROVIDERS', 'ollama,openai,anthropic').split(',')
+        provider_priority = os.getenv('AI_PROVIDERS', 'huggingface,openai,anthropic').split(',')
         self.current_provider = self._select_best_provider(provider_priority)
-        self.preferred_model = os.getenv('OLLAMA_MODEL', 'openhermes:7b-mistral-v2.5-q4_K_M')
+        self.preferred_model = os.getenv('HF_MODEL', 'mistralai/Mistral-7B-Instruct-v0.2')
         self.model = self._select_best_model()
         
         # Personality management
@@ -482,19 +568,19 @@ class SpectraAI:
             'creative': [
                 ('anthropic', 'claude-3-5-sonnet-20241022'),
                 ('openai', 'gpt-4o'),
-                ('ollama', 'openhermes'),
-                ('ollama', 'mistral')
+                ('huggingface', 'mistralai/Mistral-7B-Instruct-v0.2'),
+                ('huggingface', 'meta-llama/Llama-2-7b-chat-hf')
             ],
             'technical': [
                 ('openai', 'gpt-4o'),
                 ('anthropic', 'claude-3-haiku-20240307'),
-                ('ollama', 'mistral'),
+                ('huggingface', 'mistralai/Mistral-7B-Instruct-v0.2'),
                 ('ollama', 'openhermes')
             ],
             'concise': [
                 ('openai', 'gpt-4o-mini'),
                 ('anthropic', 'claude-3-haiku-20240307'),
-                ('ollama', 'mistral')
+                ('huggingface', 'meta-llama/Llama-2-7b-chat-hf')
             ]
         }
         
@@ -827,3 +913,4 @@ if __name__ == '__main__':
 
 # For Vercel deployment
 handler = app
+

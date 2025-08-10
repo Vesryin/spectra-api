@@ -1,4 +1,4 @@
-﻿# Spectra API
+# Spectra API
 
 Backend API for Spectra AI, built with FastAPI.
 
@@ -21,3 +21,4 @@ Backend API for Spectra AI, built with FastAPI.
    \\\
 
 4. Open [http://localhost:8000/docs](http://localhost:8000/docs) to access the API documentation.
+
