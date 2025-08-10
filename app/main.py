@@ -46,6 +46,13 @@ try:
 except ImportError:
     HUGGINGFACE_AVAILABLE = False
 
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    HUGGINGFACE_AVAILABLE = False
+
 if TYPE_CHECKING:
     from typing import Any as _Any
     structlog: _Any
@@ -913,4 +920,5 @@ if __name__ == '__main__':
 
 # For Vercel deployment
 handler = app
+
 
