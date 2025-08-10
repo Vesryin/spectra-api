@@ -1,18 +1,19 @@
 # Core FastAPI and server
-fastapi
-uvicorn[standard]
-pydantic
+fastapi>=0.104.0
+uvicorn[standard]>=0.23.2
+pydantic>=2.4.0
 
 # Configuration and logging
-python-dotenv
-structlog
+python-dotenv>=1.0.0
+structlog>=24.1.0
 
 # AI Models & Providers
 transformers>=4.36.0
 torch>=2.0.0
 accelerate>=0.20.0
-openai
-anthropic
+openai>=1.2.0
+anthropic>=0.5.0
+httpx>=0.25.2
 requests
 aiohttp
 
