@@ -135,10 +135,18 @@ class ToggleAutoModelRequest(BaseModel):
 class AIProvider:
     """Abstract base for AI providers"""
     
-    def __init__(self, name: str):
-        self.name = name
-        self.available = False
-        self.models: List[str] = []
+   def _check_availability(self):
+    """Check if Ollama is available"""
+    try:
+        if not OLLAMA_AVAILABLE:
+            logger.warning("ollama_package_unavailable")
+            self.available = False
+            self.models = []
+            return
+            
+        client = ollama.Client(host=self.host, timeout=self.timeout)
+        response = client.list()
+        # Rest of the method stays the same...
     
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response"""
