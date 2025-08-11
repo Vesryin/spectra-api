@@ -1,29 +1,49 @@
-"""Basic API tests for Spectra AI"""
-import pytest
-from fastapi.testclient import TestClient
+"""Basic API tests for Spectra AI (Responder ASGI app)."""
+import pytest_asyncio
+import httpx
+from app.main import api  # api is the Responder API instance
 
 
-def test_root_endpoint(client: TestClient):
+@pytest_asyncio.fixture(scope="module")
+async def client():
+    transport = httpx.ASGITransport(app=api)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for the test session."""
+    import asyncio
+
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+
+async def test_root_endpoint(client):
     """Test the root endpoint returns service info."""
-    response = client.get("/")
+    response = await client.get("/")
     assert response.status_code == 200
     data = response.json()
     assert "service" in data
     assert "Spectra AI" in data["service"]
 
 
-def test_health_endpoint(client: TestClient):
+async def test_health_endpoint(client):
     """Test the health check endpoint."""
-    response = client.get("/health")
+    response = await client.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "healthy"
     assert "timestamp" in data
 
 
-def test_status_endpoint(client: TestClient):
+async def test_status_endpoint(client):
     """Test the status endpoint."""
-    response = client.get("/api/status")
+    response = await client.get("/api/status")
     assert response.status_code == 200
     data = response.json()
     assert "status" in data
@@ -31,9 +51,9 @@ def test_status_endpoint(client: TestClient):
     assert "model" in data
 
 
-def test_models_endpoint(client: TestClient):
+async def test_models_endpoint(client):
     """Test the models list endpoint."""
-    response = client.get("/api/models")
+    response = await client.get("/api/models")
     assert response.status_code == 200
     data = response.json()
     assert "current" in data
@@ -41,16 +61,16 @@ def test_models_endpoint(client: TestClient):
     assert "timestamp" in data
 
 
-def test_metrics_endpoint(client: TestClient):
+async def test_metrics_endpoint(client):
     """Test the metrics endpoint."""
-    response = client.get("/api/metrics")
+    response = await client.get("/api/metrics")
     assert response.status_code == 200
     data = response.json()
     assert "active_model" in data
     assert "request_count" in data
 
 
-def test_invalid_endpoint(client: TestClient):
+async def test_invalid_endpoint(client):
     """Test that invalid endpoints return 404."""
-    response = client.get("/invalid/endpoint")
+    response = await client.get("/invalid/endpoint")
     assert response.status_code == 404

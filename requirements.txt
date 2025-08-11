@@ -1,22 +1,33 @@
-# Core FastAPI and server
-fastapi>=0.104.0
+# Core server (Responder + ASGI)
+responder==2.0.7
 uvicorn[standard]>=0.23.2
 pydantic>=2.4.0
+typesystem<0.3.0  # pinned for responder compatibility
 
 # Configuration and logging
 python-dotenv>=1.0.0
 structlog>=24.1.0
 
-# AI Models & Providers
-transformers>=4.36.0
-torch>=2.0.0
-accelerate>=0.20.0
-openai>=1.2.0
-anthropic>=0.5.0
+# HTTP clients
 httpx>=0.25.2
 requests
 aiohttp
 
-# Testing (only if needed)
+# Development tools
+flake8
+black
+
+# Testing
 pytest
 pytest-asyncio
+
+# AI Models & Providers (optional - install separately if needed)
+# transformers>=4.36.0
+# torch>=2.0.0
+# accelerate>=0.20.0
+# openai>=1.2.0
+# anthropic>=0.5.0
+
+# Spectra Core (shared logic/models)
+# Replace with actual version or source as needed
+spectra-core  # TODO: set version or git URL

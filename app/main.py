@@ -1,4 +1,4 @@
-"""FastAPI backend for Spectra AI.
+"""Responder backend for Spectra AI.
 
 Key protocol (enforced in code):
  - No static training data usage.
@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import os
 import time
-from datetime import datetime, timezone  # updated to include timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -20,18 +20,32 @@ load_dotenv()
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import responder
 from pydantic import BaseModel, Field
 
-# Try to import ollama, but make it optional
+# Example: Import from spectra-core (shared logic/models)
+try:
+    import spectra_core  # Replace with actual import as needed
+    SPECTRA_CORE_AVAILABLE = True
+except ImportError:
+    SPECTRA_CORE_AVAILABLE = False
+    print("Warning: spectra-core package not available. Shared logic will be disabled.")
+
+
+class HTTPError(Exception):
+    """Lightweight HTTP-style error for Responder layer."""
+    def __init__(self, status_code: int, detail: Any):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(str(detail))
+
 try:
     import ollama
     OLLAMA_AVAILABLE = True
 except ImportError:
     OLLAMA_AVAILABLE = False
-    print("Warning: ollama package not available, Ollama functionality will be disabled")
+    print("Warning: ollama package not available, "
+          "Ollama functionality will be disabled")
 
 # Conditional imports for AI providers
 try:
@@ -51,13 +65,7 @@ try:
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
     HUGGINGFACE_AVAILABLE = True
 except ImportError:
-    HUGGINGFACE_AVAILABLE = False
-
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-    HUGGINGFACE_AVAILABLE = True
-except ImportError:
+    # Heavy optional dependencies not installed – HuggingFace provider will be disabled gracefully
     HUGGINGFACE_AVAILABLE = False
 
 if TYPE_CHECKING:
@@ -76,8 +84,8 @@ structlog.configure(
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer() if LOG_FORMAT == 'json' 
-        else structlog.dev.ConsoleRenderer()
+        (structlog.processors.JSONRenderer() if LOG_FORMAT == 'json'
+         else structlog.dev.ConsoleRenderer())
     ],
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
@@ -154,6 +162,22 @@ class AIProvider:
         self.available = False
         self.models: List[str] = []
     
+    def is_available(self) -> bool:
+        """Check if provider is available"""
+        return self.available
+    
+    def get_models(self) -> List[str]:
+        """Get available models"""
+        return self.models
+    
+    def refresh_availability(self) -> None:
+        """Refresh provider availability - override in subclasses"""
+        pass
+    
+    async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
+        """Generate chat response - must be implemented by subclasses"""
+        raise NotImplementedError
+    
 class OllamaProvider(AIProvider):
     """Ollama local models provider"""
 
@@ -200,24 +224,18 @@ class OllamaProvider(AIProvider):
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response"""
         raise NotImplementedError
-    
-    def get_models(self) -> List[str]:
-        """Get available models"""
-        return self.models
-    
-    def is_available(self) -> bool:
-        """Check if provider is available"""
-        return self.available
-    
-    def refresh_availability(self) -> None:
-        """Refresh provider availability - override in subclasses"""
-        pass
 
 class HuggingFaceProvider(AIProvider):
     """Hugging Face models provider"""
     
     def __init__(self):
         super().__init__("huggingface")
+        if not HUGGINGFACE_AVAILABLE:
+            self.available = False
+            self.models = []
+            logger.warning("huggingface_not_available", error="transformers or torch not installed")
+            return
+        
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.default_model = os.getenv('HF_MODEL', 'mistralai/Mistral-7B-Instruct-v0.2')
         self.available_models = os.getenv('HF_MODELS', 'mistralai/Mistral-7B-Instruct-v0.2,meta-llama/Llama-2-7b-chat-hf').split(',')
@@ -288,7 +306,7 @@ class HuggingFaceProvider(AIProvider):
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response using Hugging Face models"""
         if not self.available:
-            raise HTTPException(status_code=500, detail="Hugging Face not available")
+            raise HTTPError(status_code=500, detail="Hugging Face not available")
         
         try:
             model_name = model or self.default_model
@@ -349,7 +367,7 @@ class HuggingFaceProvider(AIProvider):
                 "provider": "huggingface"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Hugging Face error: {str(e)}")
+            raise HTTPError(status_code=500, detail=f"Hugging Face error: {str(e)}")
 
 class OpenAIProvider(AIProvider):
     """OpenAI ChatGPT provider"""
@@ -366,7 +384,7 @@ class OpenAIProvider(AIProvider):
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response using OpenAI"""
         if not self.available:
-            raise HTTPException(status_code=500, detail="OpenAI not available")
+            raise HTTPError(status_code=500, detail="OpenAI not available")
         
         try:
             response = await asyncio.to_thread(
@@ -382,7 +400,7 @@ class OpenAIProvider(AIProvider):
                 "provider": "openai"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
+            raise HTTPError(status_code=500, detail=f"OpenAI error: {str(e)}")
 
 class AnthropicProvider(AIProvider):
     """Anthropic Claude provider"""
@@ -399,7 +417,7 @@ class AnthropicProvider(AIProvider):
     async def chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
         """Generate chat response using Anthropic Claude"""
         if not self.available:
-            raise HTTPException(status_code=500, detail="Anthropic not available")
+            raise HTTPError(status_code=500, detail="Anthropic not available")
         
         try:
             # Convert messages format for Claude
@@ -426,7 +444,7 @@ class AnthropicProvider(AIProvider):
                 "provider": "anthropic"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Claude error: {str(e)}")
+            raise HTTPError(status_code=500, detail=f"Claude error: {str(e)}")
 
 class SpectraAI:
     def __init__(self) -> None:
@@ -735,7 +753,7 @@ class SpectraAI:
                 processing_time=processing_time
             )
             
-            raise HTTPException(
+            raise HTTPError(
                 status_code=500,
                 detail={
                     "status": "error",
@@ -777,155 +795,139 @@ class SpectraAI:
 
 spectra = SpectraAI()
 
-app = FastAPI(
-    title="Spectra AI API",
-    description="Emotionally intelligent AI assistant backend",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
+api = responder.API(title="Spectra AI API")
 
-from fastapi.middleware.cors import CORSMiddleware
-
-allowed_origins = os.getenv('CORS_ORIGINS', '').split(',') or [
-    "https://spectra-ai-vercel.vercel.app",  # Your frontend URL
-    "http://localhost:3000",  # Local development
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-) 
-
-@app.get('/', response_model=Dict[str, Any])
-async def root():
-    """API info endpoint"""
-    return {
+@api.route("/")
+async def root(req, resp):
+    resp.media = {
         "service": "Spectra AI Backend API",
         "status": "running",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "frontend_url": f"http://localhost:3000",
+        "frontend_url": "http://localhost:3000",
         "model": spectra.model,
         "available_models": spectra.available_models,
-        "docs": "/docs",
         "health": "/health"
     }
 
-@app.get('/health')
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(), "personality_hash": spectra.personality_hash}
+@api.route("/health")
+async def health_check(req, resp):
+    resp.media = {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(), "personality_hash": spectra.personality_hash}
 
-@app.get('/api/status', response_model=StatusResponse)
-async def get_status():
-    """Get system status"""
+@api.route("/api/status")
+async def get_status(req, resp):
     try:
         current_models = spectra.available_models
         ai_status = "connected" if spectra.available_providers else "disconnected"
-        
-        return StatusResponse(
-            status="healthy",
-            ai_provider=f"multi-provider ({','.join(spectra.available_providers)})",
-            ollama_status=ai_status,
-            model=spectra.model,
-            available_models=current_models,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            host=os.getenv('HOST', '127.0.0.1'),
-            port=int(os.getenv('PORT', 8000))
-        )
+        resp.media = {
+            "status": "healthy",
+            "ai_provider": f"multi-provider ({','.join(spectra.available_providers)})",
+            "ollama_status": ai_status,
+            "model": spectra.model,
+            "available_models": current_models,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "host": os.getenv('HOST', '127.0.0.1'),
+            "port": int(os.getenv('PORT', 8000))
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        resp.status_code = 500
+        resp.media = {"error": str(e)}
 
-@app.get('/api/models', response_model=ModelListResponse)
-async def list_models():
+@api.route("/api/models")
+async def list_models(req, resp):
     spectra.refresh_models()
-    return ModelListResponse(
-        current=spectra.model,
-        available=spectra.available_models,
-        preferred=spectra.preferred_model,
-        timestamp=datetime.now(timezone.utc).isoformat()
-    )
+    resp.media = {
+        "current": spectra.model,
+        "available": spectra.available_models,
+        "preferred": spectra.preferred_model,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
-@app.post('/api/models/select', response_model=ModelSelectResponse)
-async def select_model(payload: ModelSelectRequest):
-    prev = spectra.model
-    selected = spectra.set_model(payload.model)
-    msg = 'model updated' if selected != prev else 'model unchanged'
-    return ModelSelectResponse(
-        status='ok',
-        selected=selected,
-        previous=prev,
-        available=spectra.available_models,
-        message=msg,
-        timestamp=datetime.now(timezone.utc).isoformat()
-    )
-
-@app.post('/api/models/refresh', response_model=ModelListResponse)
-async def refresh_models_endpoint():
-    """Force a refresh of the model list (dynamic, no static caching)."""
-    spectra.refresh_models()
-    return ModelListResponse(
-        current=spectra.model,
-        available=spectra.available_models,
-        preferred=spectra.preferred_model,
-        timestamp=datetime.now(timezone.utc).isoformat()
-    )
-
-@app.post('/api/chat', response_model=ChatResponse)
-async def chat_endpoint(chat_request: ChatRequest):
-    """Chat with Spectra AI"""
+@api.route('/api/models/select')
+async def select_model(req, resp):
     try:
-        # history is Optional[List[ChatMessage]] (default_factory ensures list), guard for type checkers
+        data = await req.media()
+        payload = ModelSelectRequest(**data)
+        prev = spectra.model
+        selected = spectra.set_model(payload.model)
+        msg = 'model updated' if selected != prev else 'model unchanged'
+        resp.media = {
+            'status': 'ok',
+            'selected': selected,
+            'previous': prev,
+            'available': spectra.available_models,
+            'message': msg,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        resp.status_code = 500
+        resp.media = {"error": str(e)}
+
+@api.route('/api/models/refresh')
+async def refresh_models_endpoint(req, resp):
+    spectra.refresh_models()
+    resp.media = {
+        "current": spectra.model,
+        "available": spectra.available_models,
+        "preferred": spectra.preferred_model,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@api.route('/api/chat')
+async def chat_endpoint(req, resp):
+    try:
+        data = await req.media()
+        chat_request = ChatRequest(**data)
         logger.info(
             "chat_request",
             preview=chat_request.message[:50],
             history=len(chat_request.history or []),
         )
         result = await spectra.generate_response(chat_request.message, chat_request.history)
-        return ChatResponse.build(
-            response=result["response"],
-            model=result["model"],
-            processing_time=result["processing_time"],
-        )
+        resp.media = {
+            "response": result["response"],
+            "model": result["model"],
+            "model_used": result["model"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "processing_time": result["processing_time"]
+        }
     except Exception as e:  # noqa: BLE001
         logger.error("chat_error", error=str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "response": "I'm having trouble processing your message right now. Please try again. 💜",
-                "status": "error",
-                "error": str(e),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        )
+        resp.status_code = 500
+        resp.media = {
+            "response": "I'm having trouble processing your message right now. Please try again. 💜",
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
 
-@app.get('/api/metrics', response_model=Dict[str, Any])
-async def metrics_endpoint():
-    return spectra.metrics()
+@api.route('/api/metrics')
+async def metrics_endpoint(req, resp):
+    resp.media = spectra.metrics()
 
-@app.post('/api/auto-model', response_model=Dict[str, Any])
-async def toggle_auto_model(req: ToggleAutoModelRequest):
-    new_value = spectra.toggle_auto_model(req.enabled)
-    return {"auto_model_enabled": new_value, "timestamp": datetime.now(timezone.utc).isoformat()}
+@api.route('/api/auto-model')
+async def toggle_auto_model_endpoint(req, resp):
+    try:
+        data = await req.media()
+        toggle_request = ToggleAutoModelRequest(**data)
+        new_value = spectra.toggle_auto_model(toggle_request.enabled)
+        resp.media = {"auto_model_enabled": new_value, "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        resp.status_code = 500
+        resp.media = {"error": str(e)}
 
-@app.get('/api/personality/hash', response_model=Dict[str,str])
-async def personality_hash():
-    return {"personality_hash": spectra.personality_hash}
+@api.route('/api/personality/hash')
+async def personality_hash(req, resp):
+    resp.media = {"personality_hash": spectra.personality_hash}
 
-@app.post('/api/personality/reload', response_model=Dict[str,str])
-async def personality_reload():
-    """Force reload of personality file (if changed)."""
+@api.route('/api/personality/reload')
+async def personality_reload(req, resp):
     before = spectra.personality_hash
-    spectra._maybe_reload_personality()  # noqa: SLF001 (intentional internal call)
+    spectra._maybe_reload_personality()  # noqa: SLF001
     changed = before != spectra.personality_hash
-    return {"personality_hash": spectra.personality_hash, "changed": str(changed).lower()}
+    resp.media = {"personality_hash": spectra.personality_hash, "changed": str(changed).lower()}
 
-@app.get('/api/debug/state', response_model=Dict[str, Any])
-async def debug_state():
-    """Debug snapshot (no static caches – all values are current)."""
+@api.route('/api/debug/state')
+async def debug_state(req, resp):
     spectra.refresh_models()
     spectra._maybe_reload_personality()  # noqa: SLF001
     base = spectra.metrics()
@@ -934,43 +936,21 @@ async def debug_state():
         "failed_models_count": len(spectra.failed_models),
         "preferred_model": spectra.preferred_model,
     })
-    return base
-
-# Exception handlers
-@app.exception_handler(404)
-async def not_found_handler(request: Request, exc):
-    return JSONResponse(
-        status_code=404,
-    content={"error": "Endpoint not found", "timestamp": datetime.now(timezone.utc).isoformat()}
-    )
-
-@app.exception_handler(500)
-async def internal_error_handler(request: Request, exc):
-    return JSONResponse(
-        status_code=500,
-    content={"error": "Internal server error", "timestamp": datetime.now(timezone.utc).isoformat()}
-    )
+    resp.media = base
 
 if __name__ == '__main__':
-    HOST = os.getenv('HOST', '0.0.0.0')  # Railway needs 0.0.0.0
+    HOST = os.getenv('HOST', '0.0.0.0')
     PORT = int(os.getenv('PORT', 8000))
-    
-    print(f"🚀 Starting Spectra AI on {HOST}:{PORT}")
-    print(f"🔧 Environment: {os.getenv('ENVIRONMENT', 'production')}")
-    print(f"🤖 Available providers: {spectra.available_providers}")
-    
-    logger.info("startup", host=HOST, port=PORT, available_providers=spectra.available_providers, log_format=os.getenv('SPECTRA_LOG_FORMAT', 'json'))
-    
+    logger.info("startup", host=HOST, port=PORT, providers=spectra.available_providers)
     uvicorn.run(
-        "main:app",
+        "main:api",
         host=HOST,
         port=PORT,
         reload=os.getenv('ENVIRONMENT') == 'development',
         log_level="info"
     )
 
-# For Vercel deployment
-handler = app
+handler = api
 
 
 

@@ -1,7 +1,0 @@
-# Minimal requirements for Vercel deployment - ALL DYNAMIC VERSIONS
-fastapi
-python-dotenv
-structlog
-openai
-anthropic
-requests
